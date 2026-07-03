@@ -170,9 +170,15 @@ async def analyze(
     client: OllamaClient,
     settings: Settings,
     progress: Callable[[int, int], None] | None = None,
+    groq=None,
 ) -> AnalysisResult:
     """Full analysis: single-shot when the transcript fits the chunk budget,
-    otherwise map (per-chunk digests) → reduce (final structured analysis)."""
+    otherwise map (per-chunk digests) → reduce (final structured analysis).
+    When the Groq cloud boost is enabled, a single call to the 120B model
+    replaces the whole local pipeline."""
+    if groq is not None and groq.enabled:
+        return await _analyze_groq(segments, groq, settings)
+
     transcript = build_transcript_text(segments)
     meta = AnalysisMeta(model=settings.ollama_model)
 
@@ -220,5 +226,28 @@ async def analyze(
     else:
         result = AnalysisResult.model_validate({k: v for k, v in parsed.items() if k != "meta"})
 
+    result.meta = meta
+    return result
+
+
+async def _analyze_groq(segments: list[dict], groq, settings: Settings) -> AnalysisResult:
+    transcript = build_transcript_text(segments)
+    meta = AnalysisMeta(model=groq.llm_model)
+    if len(transcript) > settings.groq_max_analysis_chars:
+        transcript = transcript[: settings.groq_max_analysis_chars]
+        meta.truncated = True
+
+    user_msg = f"תמליל השיחה (עם חותמות זמן):\n\n{transcript}"
+    raw = await groq.chat(SYSTEM_PROMPT, user_msg)
+    parsed = parse_analysis_json(raw)
+    if parsed is None:
+        raw = await groq.chat(SYSTEM_PROMPT + RETRY_SUFFIX, user_msg)
+        parsed = parse_analysis_json(raw)
+
+    if parsed is None:
+        meta.degraded = True
+        result = AnalysisResult(summary=(raw or "").strip())
+    else:
+        result = AnalysisResult.model_validate({k: v for k, v in parsed.items() if k != "meta"})
     result.meta = meta
     return result

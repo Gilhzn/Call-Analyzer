@@ -8,6 +8,7 @@ from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from .analysis import OllamaModelMissingError, OllamaUnavailableError, analyze
+from .groq import GroqError
 from .jobs import Job, sse
 
 log = logging.getLogger("call_analyzer.routes")
@@ -33,6 +34,7 @@ ERR_OLLAMA_MODEL_MISSING = (
     "התקינו אותו עם הפקודה: ollama pull {model}. התמליל המלא זמין למעלה."
 )
 ERR_INTERNAL = "אירעה שגיאה בלתי צפויה בעיבוד השיחה. נסו שוב."
+ERR_GROQ = "האצת הענן (Groq) נכשלה: {reason}. בדקו את המפתח, או הסירו את GROQ_API_KEY כדי לחזור לעיבוד מקומי."
 
 
 @router.get("/health")
@@ -42,6 +44,7 @@ async def health(request: Request):
         "status": "ok",
         "whisper_model": state.settings.whisper_model,
         "whisper_loaded": state.engine.loaded,
+        "groq": {"enabled": state.groq.enabled, "model": state.settings.groq_llm_model},
         "ollama": await state.ollama.probe(),
     }
 
@@ -87,20 +90,33 @@ async def process_job(job: Job, tmp_path: str, state) -> None:
     loop = asyncio.get_running_loop()
     segments: list[dict] | None = None
     # Speed: pull the analysis model into memory while whisper is transcribing,
-    # so the analysis stage starts with a hot model.
-    warmup_task = asyncio.create_task(state.ollama.warmup())
-    warmup_task.add_done_callback(lambda t: t.exception())
+    # so the analysis stage starts with a hot model (skipped in cloud mode).
+    if not state.groq.enabled:
+        warmup_task = asyncio.create_task(state.ollama.warmup())
+        warmup_task.add_done_callback(lambda t: t.exception())
     try:
         def push_threadsafe(event: str, data: dict) -> None:
             loop.call_soon_threadsafe(job.emit, event, data)
 
         try:
-            if state.semaphore.locked():
-                job.emit("status", {"stage": "queued"})
-            async with state.semaphore:
-                segments = await loop.run_in_executor(
-                    None, state.engine.transcribe_streaming, tmp_path, push_threadsafe
-                )
+            if state.groq.enabled:
+                job.emit("status", {"stage": "uploading_cloud"})
+                segments, info = await state.groq.transcribe(tmp_path)
+                job.emit("status", {
+                    "stage": "transcribing",
+                    "language": info.get("language"),
+                    "duration": info.get("duration"),
+                    "cloud": True,
+                })
+                for seg in segments:
+                    job.emit("segment", seg)
+            else:
+                if state.semaphore.locked():
+                    job.emit("status", {"stage": "queued"})
+                async with state.semaphore:
+                    segments = await loop.run_in_executor(
+                        None, state.engine.transcribe_streaming, tmp_path, push_threadsafe
+                    )
         finally:
             try:
                 os.unlink(tmp_path)
@@ -119,11 +135,15 @@ async def process_job(job: Job, tmp_path: str, state) -> None:
             state.ollama,
             settings,
             progress=lambda i, n: job.emit("status", {"stage": "analyzing", "chunk": i, "chunks": n}),
+            groq=state.groq,
         )
         job.emit("analysis", result.model_dump())
         job.emit("done", {})
         log.info("job %s completed", job.id)
 
+    except GroqError as exc:
+        log.info("job %s: groq failed (%s)", job.id, exc.reason)
+        job.emit("error", {"code": "groq_failed", "message": ERR_GROQ.format(reason=exc.reason)})
     except OllamaUnavailableError:
         log.info("job %s: ollama unreachable", job.id)
         job.emit("error", {"code": "ollama_unreachable", "message": ERR_OLLAMA_UNREACHABLE})

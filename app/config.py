@@ -16,6 +16,15 @@ class Settings(BaseSettings):
     # 0 = use all available CPU cores
     whisper_cpu_threads: int = 0
 
+    # Groq free-tier cloud boost (optional): when a key is set, transcription
+    # and analysis run on Groq's GPU servers instead of locally.
+    groq_api_key: str = ""
+    groq_base_url: str = "https://api.groq.com/openai/v1"
+    groq_asr_model: str = "whisper-large-v3-turbo"
+    groq_llm_model: str = "openai/gpt-oss-120b"
+    # ~5.5k tokens — inside the free tier's 8K tokens/minute window
+    groq_max_analysis_chars: int = 14000
+
     # Ollama
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "gemma3:4b"

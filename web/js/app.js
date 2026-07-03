@@ -28,6 +28,29 @@ const els = {
 const LLM_MODEL = "gemma-2-2b-it-q4f16_1-MLC";
 const MAX_ANALYSIS_CHARS = 6000;
 
+/* ===== Free GPU cloud boost (Groq, bring-your-own free key) ===== */
+const GROQ_BASE = "https://api.groq.com/openai/v1";
+const GROQ_ASR_MODEL = "whisper-large-v3-turbo";
+const GROQ_LLM_MODEL = "openai/gpt-oss-120b";
+const GROQ_MAX_FILE_MB = 25;        // free-tier upload cap
+const CLOUD_MAX_ANALYSIS_CHARS = 14000; // ~5.5k tokens, inside the 8K TPM free limit
+const CLOUD_KEY_STORAGE = "call-analyzer-groq";
+
+function cloudSettings() {
+  try { return JSON.parse(localStorage.getItem(CLOUD_KEY_STORAGE) || "{}"); } catch { return {}; }
+}
+
+function saveCloudSettings(patch) {
+  try {
+    localStorage.setItem(CLOUD_KEY_STORAGE, JSON.stringify({ ...cloudSettings(), ...patch }));
+  } catch { /* ignore */ }
+}
+
+function cloudActive() {
+  const s = cloudSettings();
+  return !!(s.enabled && s.key && s.key.trim());
+}
+
 const SYSTEM_PROMPT = `אתה אנליסט עסקי מומחה. תקבל תמליל של שיחה עסקית מוקלטת. נתח אותה ביסודיות והשב בעברית בלבד.
 
 השב אך ורק באובייקט JSON תקין במבנה הבא:
@@ -138,25 +161,51 @@ document.addEventListener("visibilitychange", () => {
 
 /* ===== Capability banner ===== */
 const hasWebGPU = !!navigator.gpu;
-if (!hasWebGPU) {
-  showBanner(
-    "warning",
-    "הדפדפן הזה לא תומך ב-WebGPU, ולכן יופק תמליל בלבד ללא ניתוח עסקי. לניתוח מלא השתמשו ב-Chrome או Edge עדכניים במחשב, או הריצו את הגרסה המקומית."
-  );
-}
 
 function showBanner(kind, text) {
   els.banner.className = `banner ${kind}`;
   els.banner.textContent = text;
 }
 
+function updateCapabilityBanner() {
+  if (!hasWebGPU && !cloudActive()) {
+    showBanner(
+      "warning",
+      "הדפדפן הזה לא תומך ב-WebGPU, ולכן יופק תמליל בלבד ללא ניתוח עסקי. הפעילו את האצת הענן החינמית למטה לניתוח מלא (עובד מכל דפדפן), או השתמשו ב-Chrome/Edge עדכניים במחשב."
+    );
+  } else if (els.banner.classList.contains("warning")) {
+    els.banner.className = "banner hidden";
+    els.banner.textContent = "";
+  }
+}
+
 function hideBanner() {
   els.banner.className = "banner hidden";
   els.banner.textContent = "";
-  if (!hasWebGPU) {
-    showBanner("warning", "הדפדפן הזה לא תומך ב-WebGPU — יופק תמליל בלבד ללא ניתוח עסקי.");
-  }
+  updateCapabilityBanner();
 }
+
+/* ===== Cloud settings UI ===== */
+function initCloudUI() {
+  const enabled = $("cloud-enabled");
+  const config = $("cloud-config");
+  const keyInput = $("groq-key");
+  const s = cloudSettings();
+  enabled.checked = !!s.enabled;
+  keyInput.value = s.key || "";
+  config.classList.toggle("hidden", !s.enabled);
+  enabled.addEventListener("change", () => {
+    saveCloudSettings({ enabled: enabled.checked });
+    config.classList.toggle("hidden", !enabled.checked);
+    updateCapabilityBanner();
+  });
+  keyInput.addEventListener("input", () => {
+    saveCloudSettings({ key: keyInput.value.trim() });
+    updateCapabilityBanner();
+  });
+}
+initCloudUI();
+updateCapabilityBanner();
 
 /* ===== Upload wiring ===== */
 els.dropZone.addEventListener("click", () => els.fileInput.click());
@@ -189,6 +238,120 @@ els.resetBtn.addEventListener("click", () => {
   resetUI();
 });
 
+/* ===== Cloud pipeline (Groq free tier) ===== */
+function xhrUpload(url, key, form, onPercent) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.setRequestHeader("Authorization", `Bearer ${key}`);
+    xhr.responseType = "json";
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onPercent) onPercent(Math.round((e.loaded / e.total) * 100));
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.response);
+      else reject(new Error(`HTTP ${xhr.status}: ${JSON.stringify(xhr.response?.error?.message || xhr.response || "")}`));
+    };
+    xhr.onerror = () => reject(new Error("network"));
+    xhr.send(form);
+  });
+}
+
+async function cloudTranscribe(file, key) {
+  setStage("מעלה את ההקלטה לשרת ה-GPU…");
+  setProgressBar(0);
+  const form = new FormData();
+  form.append("file", file, file.name || "audio.mp3");
+  form.append("model", GROQ_ASR_MODEL);
+  form.append("response_format", "verbose_json");
+
+  const resp = await xhrUpload(`${GROQ_BASE}/audio/transcriptions`, key, form, (pct) =>
+    setProgressBar(Math.round(pct * 0.8)) // upload is ~80% of the wait; GPU does the rest in seconds
+  );
+  setStage("מתמלל על GPU בענן…");
+  setProgressBar(90);
+
+  const segments = (resp.segments || [])
+    .map((s) => ({ start: s.start ?? 0, end: s.end ?? s.start ?? 0, text: (s.text || "").trim() }))
+    .filter((s) => s.text);
+  if (!segments.length && (resp.text || "").trim()) {
+    segments.push({ start: 0, end: 0, text: resp.text.trim() });
+  }
+  setProgressBar(100);
+  return segments;
+}
+
+async function groqChat(key, messages, jsonMode) {
+  const body = { model: GROQ_LLM_MODEL, messages, temperature: 0.2 };
+  if (jsonMode) body.response_format = { type: "json_object" };
+  const resp = await fetch(`${GROQ_BASE}/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+    body: JSON.stringify(body),
+  });
+  if (resp.status === 429) {
+    // Free-tier rate window — wait once and retry.
+    const wait = Math.min(20, parseInt(resp.headers.get("retry-after") || "10", 10));
+    setStage(`ממתין לחלון הבקשות החינמי (${wait} שניות)…`);
+    await new Promise((r) => setTimeout(r, wait * 1000));
+    return groqChat(key, messages, jsonMode);
+  }
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => null);
+    throw new Error(`HTTP ${resp.status}: ${err?.error?.message || ""}`);
+  }
+  const data = await resp.json();
+  return data.choices?.[0]?.message?.content || "";
+}
+
+async function cloudAnalyze(segments, key) {
+  state.stage = "analyzing";
+  setStage("מנתח על GPU בענן (מודל 120B)…");
+  setProgressBar(30);
+  showAnalysisSkeleton();
+
+  let transcript = segments.map((s) => `[${formatTs(s.start)}] ${s.text}`).join("\n");
+  let truncated = false;
+  if (transcript.length > CLOUD_MAX_ANALYSIS_CHARS) {
+    transcript = transcript.slice(0, CLOUD_MAX_ANALYSIS_CHARS);
+    truncated = true;
+  }
+  const messages = [
+    { role: "system", content: SYSTEM_PROMPT },
+    { role: "user", content: `תמליל השיחה (עם חותמות זמן):\n\n${transcript}` },
+  ];
+
+  let raw = await groqChat(key, messages, true).catch(() => null);
+  setProgressBar(85);
+  let parsed = raw ? parseAnalysisJson(raw) : null;
+  if (!parsed) {
+    raw = await groqChat(key, messages, false);
+    parsed = parseAnalysisJson(raw);
+  }
+  setProgressBar(100);
+  if (!parsed) {
+    return { summary: (raw || "").trim(), key_points: [], action_items: [], participants: "", sentiment: "", topics: [], meta: { degraded: true, truncated, cloud: true } };
+  }
+  parsed.meta = { truncated, degraded: false, cloud: true };
+  return normalizeAnalysis(parsed);
+}
+
+function friendlyCloudError(err) {
+  const msg = String(err?.message || err);
+  if (msg.includes("401")) return "המפתח אינו תקין";
+  if (msg.includes("413") || msg.includes("too large")) return "הקובץ גדול ממגבלת החינם (25MB)";
+  if (msg.includes("429")) return "חריגה ממכסת החינם היומית";
+  if (msg.includes("network")) return "אין חיבור לשרת";
+  return "שגיאה בשירות הענן";
+}
+
+async function runCloud(file, key) {
+  sessionSave({ stage: "transcribing", file, fileName: file.name, processedSec: 0, doneSegments: [] });
+  const segments = await cloudTranscribe(file, key);
+  if (state.cancelled) return;
+  await finishTranscript(segments);
+}
+
 /* ===== Main flow ===== */
 async function run(file, restore = null) {
   resetState();
@@ -203,6 +366,23 @@ async function run(file, restore = null) {
   keepAwake(true);
   if (restore) {
     showBanner("info", `השיחה שוחזרה — ממשיך בתמלול מהנקודה שבה נעצר (${formatTs(restore.processedSec || 0)}).`);
+  }
+
+  // Free GPU cloud boost: much faster and more accurate; falls back to
+  // in-browser processing on any failure.
+  if (cloudActive()) {
+    if (file.size <= GROQ_MAX_FILE_MB * 1024 * 1024) {
+      try {
+        await runCloud(file, cloudSettings().key.trim());
+        return;
+      } catch (err) {
+        if (state.cancelled) return;
+        console.error(err);
+        showBanner("warning", `האצת הענן נכשלה (${friendlyCloudError(err)}) — ממשיך בעיבוד מקומי בדפדפן.`);
+      }
+    } else {
+      showBanner("warning", `הקובץ גדול ממגבלת החינם של הענן (${GROQ_MAX_FILE_MB}MB) — מעבד מקומית בדפדפן.`);
+    }
   }
 
   try {
@@ -258,15 +438,39 @@ async function finishTranscript(segments) {
   segments.forEach(appendSegment);
   els.copyTranscript.disabled = false;
 
+  // Transcript is safe — the audio is no longer needed for resume.
+  sessionSave({ stage: "analyzing", file: null, segments, doneSegments: [] });
+  await analysisStage(segments);
+}
+
+// Picks the best available analysis engine: free cloud GPU → local WebGPU →
+// transcript-only. Cloud failures fall through to the next option.
+async function analysisStage(segments) {
+  if (cloudActive()) {
+    try {
+      const analysis = await cloudAnalyze(segments, cloudSettings().key.trim());
+      if (state.cancelled) return;
+      state.analysis = analysis;
+      renderAnalysis(analysis);
+      els.copyAnalysis.disabled = false;
+      sessionSave({ stage: "done", analysis });
+      finish();
+      return;
+    } catch (err) {
+      if (state.cancelled) return;
+      console.error(err);
+      showBanner("warning", `ניתוח הענן נכשל (${friendlyCloudError(err)})` +
+        (hasWebGPU ? " — עובר לניתוח מקומי בדפדפן." : "."));
+    }
+  }
+
   if (!hasWebGPU) {
-    renderPanelError(els.analysisBody, "ניתוח עסקי אינו זמין בדפדפן זה (אין תמיכת WebGPU). התמליל המלא זמין להעתקה.");
-    sessionSave({ stage: "done", file: null, segments, analysis: null, doneSegments: [] });
+    renderPanelError(els.analysisBody, "ניתוח עסקי אינו זמין בדפדפן זה (אין תמיכת WebGPU וללא מפתח ענן). התמליל המלא זמין להעתקה.");
+    sessionSave({ stage: "done", analysis: null });
     finish();
     return;
   }
 
-  // Transcript is safe — the audio is no longer needed for resume.
-  sessionSave({ stage: "analyzing", file: null, segments, doneSegments: [] });
   await runAnalysisStage(segments);
 }
 
@@ -333,8 +537,8 @@ async function tryRestoreSession() {
     showBanner("info", "השיחה שוחזרה — ממשיך בניתוח מהנקודה שבה נעצר.");
     startTimer();
     keepAwake(true);
-    if (hasWebGPU) preloadLLM();
-    await runAnalysisStage(saved.segments);
+    if (hasWebGPU && !cloudActive()) preloadLLM();
+    await analysisStage(saved.segments);
     return;
   }
 

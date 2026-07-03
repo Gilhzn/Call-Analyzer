@@ -136,6 +136,11 @@ async function checkHealth() {
   try {
     const res = await fetch("/api/health");
     const health = await res.json();
+    if (health.groq?.enabled) {
+      // Cloud boost mode — Ollama isn't used, so don't warn about it.
+      if (els.banner.classList.contains("warning")) hideBanner();
+      return;
+    }
     if (!health.ollama.reachable) {
       showBanner(
         "warning",
@@ -257,8 +262,11 @@ function listen(jobId, after = -1) {
       case "loading_model":
         setStage("טוען את מודל התמלול (בפעם הראשונה זה עשוי לקחת מספר דקות)…");
         break;
+      case "uploading_cloud":
+        setStage("מעבד על GPU בענן (Groq)…");
+        break;
       case "transcribing":
-        setStage("מתמלל את השיחה…");
+        setStage(data.cloud ? "מתמלל על GPU בענן…" : "מתמלל את השיחה…");
         state.duration = data.duration || 0;
         setProgressBar(0);
         if (data.language) {

@@ -35,8 +35,24 @@
         <p class="drop-hint"><bdi dir="ltr">mp3 · wav · m4a · ogg · webm</bdi> ועוד</p>
         <input type="file" id="file-input" accept="audio/*,video/mp4,video/webm,.mp3,.wav,.m4a,.mp4,.aac,.ogg,.opus,.flac,.webm" hidden>
       </div>
-      <div class="model-row">
-        <label for="model-select">איכות תמלול:</label>
+      <div class="cloud-card">
+        <label class="cloud-toggle">
+          <input type="checkbox" id="cloud-enabled">
+          <span>⚡ האצת ענן חינם (GPU) — תמלול וניתוח מהירים ומדויקים פי כמה</span>
+        </label>
+        <div id="cloud-config" class="cloud-config hidden">
+          <p class="cloud-help">
+            העיבוד ירוץ על שרתי ה-GPU של Groq עם Whisper large-v3-turbo ומודל ניתוח של 120B פרמטרים — בחינם, ללא כרטיס אשראי.
+            מנפיקים מפתח חינם ב-<a href="https://console.groq.com/keys" target="_blank" rel="noopener" dir="ltr">console.groq.com/keys</a> ומדביקים כאן:
+          </p>
+          <input type="password" id="groq-key" class="cloud-key" placeholder="gsk_..." dir="ltr" autocomplete="off">
+          <p class="cloud-note">
+            המפתח נשמר בדפדפן שלכם בלבד. במצב זה ההקלטה נשלחת ל-Groq לעיבוד (לפי מדיניות הפרטיות שלהם); אם ההאצה נכשלת — האפליקציה חוזרת אוטומטית לעיבוד מקומי בדפדפן.
+          </p>
+        </div>
+      </div>
+      <div class="model-row" id="local-model-row">
+        <label for="model-select">איכות תמלול (עיבוד מקומי):</label>
         <select id="model-select">
           <option value="onnx-community/whisper-tiny">מהיר (~40MB) — איכות בסיסית</option>
           <option value="onnx-community/whisper-base">מאוזן (~80MB)</option>

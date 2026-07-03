@@ -407,3 +407,36 @@ html, body {
 .seg.live span { opacity: 0.75; }
 .seg.live::after { content: "…"; color: var(--text-muted); }
 .banner.info { background: var(--primary-soft); color: var(--primary); }
+
+/* ===== Cloud boost ===== */
+.cloud-card {
+  margin-block-start: 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 16px;
+  background: var(--surface-2);
+}
+.cloud-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.92rem;
+}
+.cloud-toggle input { accent-color: var(--primary); width: 16px; height: 16px; }
+.cloud-config { margin-block-start: 10px; }
+.cloud-help { margin: 0 0 8px; font-size: 0.85rem; }
+.cloud-help a { color: var(--primary); unicode-bidi: embed; }
+.cloud-key {
+  width: 100%;
+  font-family: inherit;
+  font-size: 0.9rem;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+}
+.cloud-key:focus { outline: 2px solid var(--primary); border-color: var(--primary); }
+.cloud-note { margin: 8px 0 0; color: var(--text-muted); font-size: 0.8rem; }

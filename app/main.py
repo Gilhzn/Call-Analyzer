@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .analysis import OllamaClient
 from .config import get_settings
+from .groq import GroqClient
 from .jobs import JobRegistry
 from .routes import router
 from .transcription import WhisperEngine
@@ -26,6 +27,7 @@ async def lifespan(app: FastAPI):
     app.state.registry = JobRegistry(settings.job_ttl_seconds)
     app.state.engine = WhisperEngine(settings)
     app.state.ollama = OllamaClient(settings)
+    app.state.groq = GroqClient(settings)
     app.state.semaphore = asyncio.Semaphore(settings.max_concurrent_jobs)
 
     reaper_task = asyncio.create_task(app.state.registry.reaper())
