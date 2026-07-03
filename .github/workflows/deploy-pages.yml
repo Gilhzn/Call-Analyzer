@@ -29,12 +29,12 @@ jobs:
         with:
           path: web
 
+  # No `environment:` gate — deployment protection rules on the auto-created
+  # github-pages environment rejected gated jobs before they could start.
+  # deploy-pages authenticates via OIDC and works without the declaration.
   deploy:
     needs: build
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
