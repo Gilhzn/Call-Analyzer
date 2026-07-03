@@ -353,3 +353,25 @@ html, body {
   padding: 10px 24px 26px;
 }
 .site-footer p { margin: 0; }
+
+/* ===== Progress percentage ===== */
+.progress-percent {
+  color: var(--primary);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.progress-bar-wrap {
+  margin-block-start: 8px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.progress-bar {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: var(--primary);
+  transition: width 0.25s ease;
+}

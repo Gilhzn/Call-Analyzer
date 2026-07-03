@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import threading
 
 from .config import Settings
@@ -36,6 +37,7 @@ class WhisperEngine:
                         self._settings.whisper_model,
                         device=self._settings.whisper_device,
                         compute_type=self._settings.whisper_compute_type,
+                        cpu_threads=self._settings.whisper_cpu_threads or (os.cpu_count() or 4),
                     )
                     log.info("whisper model loaded")
         return self._model
@@ -56,7 +58,13 @@ class WhisperEngine:
             push("status", {"stage": "loading_model", "model": self._settings.whisper_model})
         model = self.get_model()
 
-        segments, info = model.transcribe(path, language=None, vad_filter=True, beam_size=5)
+        segments, info = model.transcribe(
+            path,
+            language=None,
+            vad_filter=True,
+            beam_size=self._settings.whisper_beam_size,
+            condition_on_previous_text=False,
+        )
         push(
             "status",
             {

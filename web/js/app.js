@@ -11,6 +11,7 @@ const els = {
   progressSection: $("progress-section"),
   progressStage: $("progress-stage"),
   progressElapsed: $("progress-elapsed"),
+  progressPercent: $("progress-percent"),
   progressDetail: $("progress-detail"),
   progressBarWrap: $("progress-bar-wrap"),
   progressBar: $("progress-bar"),
@@ -43,12 +44,13 @@ const SYSTEM_PROMPT = `אתה אנליסט עסקי מומחה. תקבל תמל�
 
 const state = {
   worker: null,
-  llmEngine: null,
+  enginePromise: null,
   segments: [],
   analysis: null,
   timerId: null,
   startedAt: null,
   cancelled: false,
+  stage: "idle",
 };
 
 /* ===== Capability banner ===== */
@@ -112,10 +114,15 @@ async function run(file) {
     setStage("קורא ומפענח את קובץ השמע…");
     const audio = await decodeAudio(file);
 
+    // Speed: start downloading/compiling the analysis model in parallel with
+    // the transcription instead of after it.
+    preloadLLM();
+
     setStage("טוען את מודל התמלול (הורדה חד-פעמית, נשמר במטמון)…");
     const segments = await transcribe(audio);
     if (state.cancelled) return;
 
+    state.stage = "asr_done";
     state.segments = segments;
     els.transcriptBody.replaceChildren();
     if (!segments.length) {
@@ -132,7 +139,8 @@ async function run(file) {
       return;
     }
 
-    setStage("טוען את מודל הניתוח (הורדה חד-פעמית של כ-1.4GB בפעם הראשונה)…");
+    state.stage = "llm";
+    setStage("טוען את מודל הניתוח (הורדה חד-פעמית, נשמר במטמון)…");
     showAnalysisSkeleton();
     const analysis = await analyze(segments);
     if (state.cancelled) return;
@@ -192,20 +200,25 @@ async function decodeAudio(file) {
 
 /* ===== Transcription via worker ===== */
 function transcribe(audio) {
+  const duration = audio.length / 16000;
   return new Promise((resolve, reject) => {
     const worker = new Worker("js/asr-worker.js", { type: "module" });
     state.worker = worker;
+    state.stage = "asr";
     worker.onmessage = (event) => {
       const msg = event.data;
       if (msg.type === "download") {
         setStage("מוריד את מודל התמלול (חד-פעמי)…");
-        setDetail(msg.file || "");
-        setProgressBar(msg.progress);
+        setProgressBar(msg.percent);
       } else if (msg.type === "stage" && msg.stage === "transcribing") {
-        setStage("מתמלל את השיחה… (זה יכול לקחת כמה דקות, לפי אורך ההקלטה)");
-        setDetail("");
-        setProgressBar(null);
+        setStage(msg.device === "webgpu" ? "מתמלל את השיחה… (מואץ GPU)" : "מתמלל את השיחה…");
+        setProgressBar(0);
+      } else if (msg.type === "progress") {
+        setProgressBar(msg.percent);
+      } else if (msg.type === "partial") {
+        renderPartialSegment(msg.start, msg.text);
       } else if (msg.type === "result") {
+        setProgressBar(100);
         worker.terminate();
         state.worker = null;
         resolve(msg.segments);
@@ -221,30 +234,68 @@ function transcribe(audio) {
       reject(new Error(e.message || "worker error"));
     };
     worker.postMessage(
-      { type: "transcribe", audio, model: els.modelSelect.value },
+      { type: "transcribe", audio, model: els.modelSelect.value, duration },
       [audio.buffer]
     );
   });
 }
 
-/* ===== Analysis via WebLLM ===== */
-async function analyze(segments) {
-  const webllm = await import("https://esm.run/@mlc-ai/web-llm");
+// Live text of the chunk whisper is currently decoding.
+function renderPartialSegment(start, text) {
+  if (!text.trim()) return;
+  const ph = els.transcriptBody.querySelector(".placeholder");
+  if (ph) ph.remove();
 
-  if (!state.llmEngine) {
-    state.llmEngine = await webllm.CreateMLCEngine(LLM_MODEL, {
+  let live = els.transcriptBody.querySelector(`.seg.live[data-start="${start}"]`);
+  if (!live) {
+    els.transcriptBody.querySelectorAll(".seg.live").forEach((el) => el.classList.remove("live"));
+    live = document.createElement("div");
+    live.className = "seg live";
+    live.dataset.start = start;
+    const ts = document.createElement("bdi");
+    ts.className = "ts";
+    ts.textContent = `[${formatTs(start)}]`;
+    const span = document.createElement("span");
+    live.append(ts, span);
+    els.transcriptBody.appendChild(live);
+  }
+  live.querySelector("span").textContent = text.trim();
+  els.transcriptBody.scrollTop = els.transcriptBody.scrollHeight;
+}
+
+/* ===== Analysis via WebLLM ===== */
+// Kicked off in parallel with transcription so the model download/compile
+// overlaps the transcription instead of running after it.
+function preloadLLM() {
+  if (!hasWebGPU || state.enginePromise) return;
+  state.enginePromise = (async () => {
+    const webllm = await import("https://esm.run/@mlc-ai/web-llm");
+    return webllm.CreateMLCEngine(LLM_MODEL, {
       initProgressCallback: (report) => {
-        setDetail(report.text || "");
-        if (typeof report.progress === "number") setProgressBar(Math.round(report.progress * 100));
+        const percent = typeof report.progress === "number" ? Math.round(report.progress * 100) : null;
+        if (state.stage === "llm") {
+          if (percent != null) setProgressBar(percent);
+          setDetail(report.text || "");
+        } else if (percent != null && percent < 100) {
+          // Transcription is on screen — note the background download quietly.
+          setDetail(`מודל הניתוח יורד ברקע: ${percent}%`);
+        }
       },
     });
-  }
+  })();
+  state.enginePromise.catch(() => { state.enginePromise = null; });
+  return state.enginePromise;
+}
 
+async function analyze(segments) {
+  const engine = await (state.enginePromise || preloadLLM());
+
+  state.stage = "analyzing";
   setStage("מנתח ומסכם את השיחה…");
   setDetail("");
-  setProgressBar(null);
+  setProgressBar(0);
 
-  let transcript = state.segments.map((s) => `[${formatTs(s.start)}] ${s.text}`).join("\n");
+  let transcript = segments.map((s) => `[${formatTs(s.start)}] ${s.text}`).join("\n");
   let truncated = false;
   if (transcript.length > MAX_ANALYSIS_CHARS) {
     transcript = transcript.slice(0, MAX_ANALYSIS_CHARS);
@@ -256,18 +307,33 @@ async function analyze(segments) {
     { role: "user", content: `תמליל השיחה (עם חותמות זמן):\n\n${transcript}` },
   ];
 
-  let raw;
+  // Stream the generation so the progress percentage moves in real time.
+  let raw = "";
   try {
-    const resp = await state.llmEngine.chat.completions.create({
+    const stream = await engine.chat.completions.create({ messages, temperature: 0.2, stream: true });
+    for await (const chunk of stream) {
+      raw += chunk.choices?.[0]?.delta?.content || "";
+      setProgressBar(Math.min(95, Math.round(raw.length / 12)));
+    }
+  } catch {
+    const resp = await engine.chat.completions.create({
       messages, temperature: 0.2, response_format: { type: "json_object" },
     });
     raw = resp.choices[0].message.content;
-  } catch {
-    const resp = await state.llmEngine.chat.completions.create({ messages, temperature: 0.2 });
-    raw = resp.choices[0].message.content;
   }
 
-  const parsed = parseAnalysisJson(raw);
+  let parsed = parseAnalysisJson(raw);
+  if (!parsed) {
+    // One structured retry before giving up on JSON.
+    try {
+      const resp = await engine.chat.completions.create({
+        messages, temperature: 0.2, response_format: { type: "json_object" },
+      });
+      parsed = parseAnalysisJson(resp.choices[0].message.content);
+      if (parsed) raw = resp.choices[0].message.content;
+    } catch { /* keep raw */ }
+  }
+  setProgressBar(100);
   if (!parsed) {
     return { summary: (raw || "").trim(), key_points: [], action_items: [], participants: "", sentiment: "", topics: [], meta: { degraded: true, truncated } };
   }
@@ -513,9 +579,12 @@ function setDetail(text) { els.progressDetail.textContent = text; }
 function setProgressBar(percent) {
   if (percent == null) {
     els.progressBarWrap.classList.add("hidden");
+    els.progressPercent.textContent = "";
   } else {
+    const clamped = Math.max(0, Math.min(100, percent));
     els.progressBarWrap.classList.remove("hidden");
-    els.progressBar.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+    els.progressBar.style.width = `${clamped}%`;
+    els.progressPercent.textContent = `${clamped}%`;
   }
 }
 

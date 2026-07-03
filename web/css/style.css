@@ -355,18 +355,6 @@ html, body {
 .site-footer p { margin: 0; }
 
 /* ===== Web-demo additions ===== */
-.demo-tag {
-  display: inline-block;
-  background: var(--primary-soft);
-  color: var(--primary);
-  border-radius: 999px;
-  padding: 2px 10px;
-  font-size: 0.62em;
-  font-weight: 700;
-  vertical-align: middle;
-  margin-inline-start: 8px;
-}
-
 .model-row {
   display: flex;
   align-items: center;
@@ -409,3 +397,12 @@ html, body {
   background: var(--primary);
   transition: width 0.25s ease;
 }
+
+.progress-percent {
+  color: var(--primary);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.seg.live span { opacity: 0.75; }
+.seg.live::after { content: "…"; color: var(--text-muted); }

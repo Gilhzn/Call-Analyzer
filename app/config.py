@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     whisper_device: str = "auto"
     whisper_compute_type: str = "int8"
     whisper_preload: bool = False
+    # 1 = greedy decoding (fastest, near-identical quality); 5 = beam search
+    whisper_beam_size: int = 1
+    # 0 = use all available CPU cores
+    whisper_cpu_threads: int = 0
 
     # Ollama
     ollama_base_url: str = "http://localhost:11434"

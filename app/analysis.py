@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -77,6 +78,19 @@ class OllamaClient:
             raise OllamaModelMissingError(self._settings.ollama_model)
         resp.raise_for_status()
         return resp.json().get("message", {}).get("content", "")
+
+    async def warmup(self) -> None:
+        """Load the model into memory while transcription is still running, so
+        the analysis starts instantly when the transcript is ready. Failures
+        are ignored — the real call reports them properly."""
+        try:
+            async with httpx.AsyncClient(timeout=self._settings.ollama_timeout_seconds) as client:
+                await client.post(
+                    f"{self._settings.ollama_base_url}/api/generate",
+                    json={"model": self._settings.ollama_model, "keep_alive": "15m"},
+                )
+        except httpx.HTTPError:
+            pass
 
     async def probe(self) -> dict:
         """Health probe: is Ollama reachable and is the configured model pulled?"""
@@ -172,16 +186,23 @@ async def analyze(
             chunks = chunks[: settings.analysis_max_chunks]
             log.info("transcript truncated to %d chunks", len(chunks))
 
-        digests: list[str] = []
-        for i, chunk in enumerate(chunks, start=1):
-            if progress:
-                progress(i, len(chunks))
+        # Digest all chunks concurrently — Ollama parallelizes across requests,
+        # cutting long-call analysis time to roughly a single chunk's latency.
+        done = 0
+
+        async def digest_chunk(i: int, chunk: str) -> str:
+            nonlocal done
             digest = await client.chat(
                 MAP_SYSTEM_PROMPT,
                 f"קטע {i} מתוך {len(chunks)} של השיחה:\n\n{chunk}",
                 json_format=False,
             )
-            digests.append(f"--- קטע {i} ---\n{digest.strip()}")
+            done += 1
+            if progress:
+                progress(done, len(chunks))
+            return f"--- קטע {i} ---\n{digest.strip()}"
+
+        digests = await asyncio.gather(*[digest_chunk(i, c) for i, c in enumerate(chunks, start=1)])
         user_msg = "תקצירי קטעי השיחה לפי סדר כרונולוגי:\n\n" + "\n\n".join(digests)
 
     raw = await client.chat(SYSTEM_PROMPT, user_msg)

@@ -10,6 +10,9 @@ const els = {
   progressSection: $("progress-section"),
   progressStage: $("progress-stage"),
   progressElapsed: $("progress-elapsed"),
+  progressPercent: $("progress-percent"),
+  progressBarWrap: $("progress-bar-wrap"),
+  progressBar: $("progress-bar"),
   languageChip: $("language-chip"),
   cancelBtn: $("cancel-btn"),
   resultsSection: $("results-section"),
@@ -30,6 +33,7 @@ const state = {
   analysis: null,
   timerId: null,
   startedAt: null,
+  duration: 0,
 };
 
 /* ===== Health banner ===== */
@@ -148,6 +152,8 @@ function listen(jobId) {
         break;
       case "transcribing":
         setStage("מתמלל את השיחה…");
+        state.duration = data.duration || 0;
+        setProgressBar(0);
         if (data.language) {
           const name = LANG_NAMES[data.language] || data.language;
           els.languageChip.textContent = `שפה מזוהה: ${name}`;
@@ -156,6 +162,7 @@ function listen(jobId) {
         break;
       case "analyzing":
         setStage(data.chunks ? `מנתח את השיחה… (חלק ${data.chunk} מתוך ${data.chunks})` : "מנתח ומסכם את השיחה…");
+        setProgressBar(data.chunks ? Math.round((data.chunk / data.chunks) * 100) : null);
         showAnalysisSkeleton();
         break;
     }
@@ -165,10 +172,14 @@ function listen(jobId) {
     const seg = JSON.parse(e.data);
     state.segments.push(seg);
     appendSegment(seg);
+    if (state.duration) {
+      setProgressBar(Math.min(99, Math.round((seg.end / state.duration) * 100)));
+    }
   });
 
   es.addEventListener("transcript_done", () => {
     els.copyTranscript.disabled = state.segments.length === 0;
+    setProgressBar(100);
   });
 
   es.addEventListener("analysis", (e) => {
@@ -216,6 +227,8 @@ function resetState() {
   els.copyTranscript.disabled = false;
   els.copyAnalysis.disabled = true;
   els.languageChip.classList.add("hidden");
+  state.duration = 0;
+  setProgressBar(null);
 }
 
 function resetUI() {
@@ -443,6 +456,18 @@ wireCopy(els.copyAnalysis, analysisAsText);
 /* ===== Progress helpers ===== */
 function setStage(text) {
   els.progressStage.textContent = text;
+}
+
+function setProgressBar(percent) {
+  if (percent == null) {
+    els.progressBarWrap.classList.add("hidden");
+    els.progressPercent.textContent = "";
+  } else {
+    const clamped = Math.max(0, Math.min(100, percent));
+    els.progressBarWrap.classList.remove("hidden");
+    els.progressBar.style.width = `${clamped}%`;
+    els.progressPercent.textContent = `${clamped}%`;
+  }
 }
 
 function startTimer() {

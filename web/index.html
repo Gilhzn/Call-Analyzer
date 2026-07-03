@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>מנתח שיחות — דמו בדפדפן</title>
+  <title>מנתח שיחות — תמלול וניתוח עסקי</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='0.9em' font-size='90'%3E%F0%9F%8E%A7%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="css/style.css">
 </head>
@@ -13,7 +13,7 @@
       <div class="brand">
         <span class="brand-icon" aria-hidden="true">🎧</span>
         <div>
-          <h1>מנתח שיחות <span class="demo-tag">דמו בדפדפן</span></h1>
+          <h1>מנתח שיחות</h1>
           <p class="tagline">תמלול וניתוח עסקי — הכול רץ בדפדפן שלכם, שום דבר לא נשלח לשרת</p>
         </div>
       </div>
@@ -38,14 +38,14 @@
       <div class="model-row">
         <label for="model-select">איכות תמלול:</label>
         <select id="model-select">
-          <option value="Xenova/whisper-tiny">מהיר (~40MB) — איכות בסיסית</option>
-          <option value="Xenova/whisper-base">מאוזן (~80MB)</option>
-          <option value="Xenova/whisper-small" selected>איכותי (~250MB) — מומלץ לעברית</option>
+          <option value="onnx-community/whisper-tiny">מהיר (~40MB) — איכות בסיסית</option>
+          <option value="onnx-community/whisper-base">מאוזן (~80MB)</option>
+          <option value="onnx-community/whisper-small" selected>איכותי (~250MB) — מומלץ לעברית</option>
         </select>
       </div>
       <p class="privacy-note">
-        🔒 גרסת דמו: המודלים רצים בתוך הדפדפן. בהעלאה הראשונה יורדים קובצי מודל (חד-פעמי, נשמר במטמון הדפדפן) — מומלץ חיבור Wi-Fi.
-        לאיכות מלאה ומהירות גבוהה הריצו את <a href="https://github.com/Gilhzn/Call-Analyzer" target="_blank" rel="noopener">הגרסה המקומית</a>.
+        🔒 המודלים רצים בתוך הדפדפן — הקובץ לא נשלח לשום שרת. בהעלאה הראשונה יורדים קובצי מודל (חד-פעמי, נשמר במטמון הדפדפן) — מומלץ חיבור Wi-Fi.
+        לאיכות ומהירות מרביות הריצו את <a href="https://github.com/Gilhzn/Call-Analyzer" target="_blank" rel="noopener">הגרסה המלאה</a>.
       </p>
     </section>
 
@@ -57,6 +57,7 @@
           <p id="progress-stage" class="progress-stage">מכין…</p>
           <p class="progress-sub">
             <span id="progress-elapsed">00:00</span>
+            <span id="progress-percent" class="progress-percent"></span>
             <span id="progress-detail" class="progress-detail"></span>
           </p>
           <div id="progress-bar-wrap" class="progress-bar-wrap hidden"><div id="progress-bar" class="progress-bar"></div></div>
@@ -100,7 +101,7 @@
   </main>
 
   <footer class="site-footer">
-    <p>דמו בדפדפן: Whisper (transformers.js) + WebLLM · <a href="https://github.com/Gilhzn/Call-Analyzer" target="_blank" rel="noopener">קוד המקור והגרסה המלאה</a></p>
+    <p>מופעל על ידי Whisper (transformers.js) + WebLLM — עיבוד בדפדפן בלבד, ללא שמירת נתונים · <a href="https://github.com/Gilhzn/Call-Analyzer" target="_blank" rel="noopener">קוד המקור והגרסה המלאה</a></p>
   </footer>
 
   <script type="module" src="js/app.js"></script>

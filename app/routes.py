@@ -86,6 +86,10 @@ async def process_job(job: Job, tmp_path: str, state) -> None:
     settings = state.settings
     loop = asyncio.get_running_loop()
     segments: list[dict] | None = None
+    # Speed: pull the analysis model into memory while whisper is transcribing,
+    # so the analysis stage starts with a hot model.
+    warmup_task = asyncio.create_task(state.ollama.warmup())
+    warmup_task.add_done_callback(lambda t: t.exception())
     try:
         try:
             if state.semaphore.locked():
