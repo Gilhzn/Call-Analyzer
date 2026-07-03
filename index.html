@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html dir="rtl" lang="he">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>מנתח שיחות — דמו בדפדפן</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='0.9em' font-size='90'%3E%F0%9F%8E%A7%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="brand">
+        <span class="brand-icon" aria-hidden="true">🎧</span>
+        <div>
+          <h1>מנתח שיחות <span class="demo-tag">דמו בדפדפן</span></h1>
+          <p class="tagline">תמלול וניתוח עסקי — הכול רץ בדפדפן שלכם, שום דבר לא נשלח לשרת</p>
+        </div>
+      </div>
+      <div class="privacy-badge" title="העיבוד כולו מתבצע בדפדפן — הקובץ לא עוזב את המחשב שלכם">
+        <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm-1.4 15.6L6.4 12.4l1.4-1.4 2.8 2.8 5.6-5.6 1.4 1.4-7 7z"/></svg>
+        <span>הקובץ לא עוזב את המחשב</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <div id="banner" class="banner hidden" role="alert"></div>
+
+    <!-- Upload -->
+    <section id="upload-section" class="card upload-card">
+      <div id="drop-zone" class="drop-zone" tabindex="0" role="button" aria-label="העלאת קובץ שמע">
+        <svg class="drop-icon" viewBox="0 0 24 24" width="44" height="44" aria-hidden="true"><path fill="currentColor" d="M12 3a4 4 0 0 1 4 4v5a4 4 0 0 1-8 0V7a4 4 0 0 1 4-4zm-6 9a6 6 0 0 0 12 0h2a8 8 0 0 1-7 7.94V22h-2v-2.06A8 8 0 0 1 4 12h2z"/></svg>
+        <p class="drop-title">גררו לכאן הקלטת שיחה או לחצו לבחירת קובץ</p>
+        <p class="drop-hint"><bdi dir="ltr">mp3 · wav · m4a · ogg · webm</bdi> ועוד</p>
+        <input type="file" id="file-input" accept="audio/*,video/mp4,video/webm,.mp3,.wav,.m4a,.mp4,.aac,.ogg,.opus,.flac,.webm" hidden>
+      </div>
+      <div class="model-row">
+        <label for="model-select">איכות תמלול:</label>
+        <select id="model-select">
+          <option value="Xenova/whisper-tiny">מהיר (~40MB) — איכות בסיסית</option>
+          <option value="Xenova/whisper-base">מאוזן (~80MB)</option>
+          <option value="Xenova/whisper-small" selected>איכותי (~250MB) — מומלץ לעברית</option>
+        </select>
+      </div>
+      <p class="privacy-note">
+        🔒 גרסת דמו: המודלים רצים בתוך הדפדפן. בהעלאה הראשונה יורדים קובצי מודל (חד-פעמי, נשמר במטמון הדפדפן) — מומלץ חיבור Wi-Fi.
+        לאיכות מלאה ומהירות גבוהה הריצו את <a href="https://github.com/Gilhzn/Call-Analyzer" target="_blank" rel="noopener">הגרסה המקומית</a>.
+      </p>
+    </section>
+
+    <!-- Progress -->
+    <section id="progress-section" class="card progress-card hidden" aria-live="polite">
+      <div class="progress-row">
+        <div class="spinner" aria-hidden="true"></div>
+        <div class="progress-texts">
+          <p id="progress-stage" class="progress-stage">מכין…</p>
+          <p class="progress-sub">
+            <span id="progress-elapsed">00:00</span>
+            <span id="progress-detail" class="progress-detail"></span>
+          </p>
+          <div id="progress-bar-wrap" class="progress-bar-wrap hidden"><div id="progress-bar" class="progress-bar"></div></div>
+        </div>
+        <button id="cancel-btn" class="btn btn-ghost" type="button">ביטול</button>
+      </div>
+    </section>
+
+    <!-- Results -->
+    <section id="results-section" class="results-grid hidden">
+      <div class="card panel" id="transcript-panel">
+        <div class="panel-header">
+          <h2>תמליל השיחה</h2>
+          <button class="btn btn-copy" id="copy-transcript" type="button" title="העתקת התמליל" disabled>
+            <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z"/></svg>
+            <span>העתקה</span>
+          </button>
+        </div>
+        <div id="transcript-body" class="panel-body transcript-body">
+          <p class="placeholder">התמליל יופיע כאן…</p>
+        </div>
+      </div>
+
+      <div class="card panel" id="analysis-panel">
+        <div class="panel-header">
+          <h2>ניתוח עסקי</h2>
+          <button class="btn btn-copy" id="copy-analysis" type="button" title="העתקת הסיכום" disabled>
+            <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z"/></svg>
+            <span>העתקה</span>
+          </button>
+        </div>
+        <div id="analysis-body" class="panel-body analysis-body">
+          <p class="placeholder">הניתוח והסיכום יופיעו כאן לאחר התמלול…</p>
+        </div>
+      </div>
+    </section>
+
+    <div id="reset-row" class="reset-row hidden">
+      <button id="reset-btn" class="btn btn-primary" type="button">ניתוח שיחה חדשה</button>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <p>דמו בדפדפן: Whisper (transformers.js) + WebLLM · <a href="https://github.com/Gilhzn/Call-Analyzer" target="_blank" rel="noopener">קוד המקור והגרסה המלאה</a></p>
+  </footer>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
