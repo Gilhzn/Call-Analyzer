@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Test/media files — recordings must never be committed
+*.wav
+*.mp3
+*.m4a
+*.ogg
+*.opus
+*.flac
+*.webm
+*.amr
+*.aac
+*.wma
+
+# Editor/OS
+.idea/
+.vscode/
+.DS_Store
