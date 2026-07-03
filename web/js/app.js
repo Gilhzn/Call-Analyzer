@@ -51,7 +51,90 @@ const state = {
   startedAt: null,
   cancelled: false,
   stage: "idle",
+  // Session-resume bookkeeping (survives the tab being killed in background)
+  sourceFile: null,
+  totalDuration: 0,
+  priorSegments: [],
+  completedChunks: [],
+  wakeLock: null,
 };
+
+/* ===== Durable session store (IndexedDB) =====
+   Mobile browsers discard background tabs; everything needed to continue —
+   the audio file, completed transcript chunks and the analysis — is saved
+   here so a reload resumes from the exact spot instead of starting over. */
+const DB_NAME = "call-analyzer";
+const DB_STORE = "session";
+const SESSION_KEY = "current";
+
+function openDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(DB_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function sessionSave(patch) {
+  try {
+    const db = await openDb();
+    const existing = await new Promise((resolve) => {
+      const rq = db.transaction(DB_STORE).objectStore(DB_STORE).get(SESSION_KEY);
+      rq.onsuccess = () => resolve(rq.result || {});
+      rq.onerror = () => resolve({});
+    });
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(DB_STORE, "readwrite");
+      tx.objectStore(DB_STORE).put({ ...existing, ...patch, savedAt: Date.now() }, SESSION_KEY);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch { /* storage unavailable — continue without resume support */ }
+}
+
+async function sessionLoad() {
+  try {
+    const db = await openDb();
+    return await new Promise((resolve) => {
+      const rq = db.transaction(DB_STORE).objectStore(DB_STORE).get(SESSION_KEY);
+      rq.onsuccess = () => resolve(rq.result || null);
+      rq.onerror = () => resolve(null);
+    });
+  } catch { return null; }
+}
+
+async function sessionClear() {
+  try {
+    const db = await openDb();
+    await new Promise((resolve) => {
+      const tx = db.transaction(DB_STORE, "readwrite");
+      tx.objectStore(DB_STORE).delete(SESSION_KEY);
+      tx.oncomplete = resolve;
+      tx.onerror = resolve;
+    });
+  } catch { /* ignore */ }
+}
+
+/* ===== Screen wake lock — keeps the phone from sleeping mid-processing ===== */
+async function keepAwake(on) {
+  try {
+    if (on && "wakeLock" in navigator && !state.wakeLock) {
+      state.wakeLock = await navigator.wakeLock.request("screen");
+      state.wakeLock.addEventListener("release", () => { state.wakeLock = null; });
+    } else if (!on && state.wakeLock) {
+      await state.wakeLock.release();
+      state.wakeLock = null;
+    }
+  } catch { /* not supported / denied — non-fatal */ }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" &&
+      ["asr", "llm", "analyzing"].includes(state.stage)) {
+    keepAwake(true);
+  }
+});
 
 /* ===== Capability banner ===== */
 const hasWebGPU = !!navigator.gpu;
@@ -97,48 +180,98 @@ els.cancelBtn.addEventListener("click", () => {
   state.cancelled = true;
   if (state.worker) { state.worker.terminate(); state.worker = null; }
   stopTimer();
+  keepAwake(false);
+  sessionClear();
   resetUI();
 });
-els.resetBtn.addEventListener("click", resetUI);
+els.resetBtn.addEventListener("click", () => {
+  sessionClear();
+  resetUI();
+});
 
 /* ===== Main flow ===== */
-async function run(file) {
+async function run(file, restore = null) {
   resetState();
   state.cancelled = false;
+  state.sourceFile = file;
+  state.priorSegments = restore?.doneSegments || [];
+  state.completedChunks = [];
   els.uploadSection.classList.add("hidden");
   els.progressSection.classList.remove("hidden");
   els.resultsSection.classList.remove("hidden");
   startTimer();
+  keepAwake(true);
+  if (restore) {
+    showBanner("info", `השיחה שוחזרה — ממשיך בתמלול מהנקודה שבה נעצר (${formatTs(restore.processedSec || 0)}).`);
+  }
 
   try {
     setStage("קורא ומפענח את קובץ השמע…");
-    const audio = await decodeAudio(file);
+    const fullAudio = await decodeAudio(file);
+    state.totalDuration = fullAudio.length / 16000;
+
+    const baseOffset = Math.min(restore?.processedSec || 0, state.totalDuration);
+    const audio = baseOffset > 0 ? fullAudio.slice(Math.floor(baseOffset * 16000)) : fullAudio;
+
+    if (state.priorSegments.length) {
+      els.transcriptBody.replaceChildren();
+      state.priorSegments.forEach(appendSegment);
+    }
+
+    if (!restore) {
+      await sessionClear();
+    }
+    sessionSave({
+      stage: "transcribing",
+      file,
+      fileName: file.name,
+      model: els.modelSelect.value,
+      processedSec: baseOffset,
+      doneSegments: state.priorSegments,
+    });
 
     // Speed: start downloading/compiling the analysis model in parallel with
     // the transcription instead of after it.
     preloadLLM();
 
     setStage("טוען את מודל התמלול (הורדה חד-פעמית, נשמר במטמון)…");
-    const segments = await transcribe(audio);
+    const newSegments = await transcribe(audio, baseOffset);
     if (state.cancelled) return;
 
-    state.stage = "asr_done";
-    state.segments = segments;
-    els.transcriptBody.replaceChildren();
-    if (!segments.length) {
-      renderPanelError(els.transcriptBody, "לא זוהה דיבור בהקלטה.");
-      finish();
-      return;
-    }
-    segments.forEach(appendSegment);
-    els.copyTranscript.disabled = false;
+    const segments = [...state.priorSegments, ...newSegments];
+    await finishTranscript(segments);
+  } catch (err) {
+    handleRunError(err);
+  }
+}
 
-    if (!hasWebGPU) {
-      renderPanelError(els.analysisBody, "ניתוח עסקי אינו זמין בדפדפן זה (אין תמיכת WebGPU). התמליל המלא זמין להעתקה.");
-      finish();
-      return;
-    }
+async function finishTranscript(segments) {
+  state.stage = "asr_done";
+  state.segments = segments;
+  els.transcriptBody.replaceChildren();
+  if (!segments.length) {
+    renderPanelError(els.transcriptBody, "לא זוהה דיבור בהקלטה.");
+    sessionClear();
+    finish();
+    return;
+  }
+  segments.forEach(appendSegment);
+  els.copyTranscript.disabled = false;
 
+  if (!hasWebGPU) {
+    renderPanelError(els.analysisBody, "ניתוח עסקי אינו זמין בדפדפן זה (אין תמיכת WebGPU). התמליל המלא זמין להעתקה.");
+    sessionSave({ stage: "done", file: null, segments, analysis: null, doneSegments: [] });
+    finish();
+    return;
+  }
+
+  // Transcript is safe — the audio is no longer needed for resume.
+  sessionSave({ stage: "analyzing", file: null, segments, doneSegments: [] });
+  await runAnalysisStage(segments);
+}
+
+async function runAnalysisStage(segments) {
+  try {
     state.stage = "llm";
     setStage("טוען את מודל הניתוח (הורדה חד-פעמית, נשמר במטמון)…");
     showAnalysisSkeleton();
@@ -148,17 +281,69 @@ async function run(file) {
     state.analysis = analysis;
     renderAnalysis(analysis);
     els.copyAnalysis.disabled = false;
+    sessionSave({ stage: "done", analysis });
     finish();
   } catch (err) {
-    if (state.cancelled) return;
-    console.error(err);
-    if (!state.segments.length) {
-      renderPanelError(els.transcriptBody, "התמלול נכשל: " + friendlyError(err));
-      renderPanelError(els.analysisBody, "הניתוח לא הופק כי התמלול נכשל.");
-    } else {
-      renderPanelError(els.analysisBody, "הניתוח נכשל: " + friendlyError(err) + " התמליל המלא זמין להעתקה.");
+    handleRunError(err);
+  }
+}
+
+function handleRunError(err) {
+  if (state.cancelled) return;
+  console.error(err);
+  if (!state.segments.length) {
+    renderPanelError(els.transcriptBody, "התמלול נכשל: " + friendlyError(err));
+    renderPanelError(els.analysisBody, "הניתוח לא הופק כי התמלול נכשל.");
+  } else {
+    renderPanelError(els.analysisBody, "הניתוח נכשל: " + friendlyError(err) + " התמליל המלא זמין להעתקה.");
+  }
+  finish();
+}
+
+/* ===== Resume after the tab was killed or the page reloaded ===== */
+async function tryRestoreSession() {
+  const saved = await sessionLoad();
+  if (!saved || !saved.stage) return;
+
+  if (saved.stage === "done" && saved.segments?.length) {
+    els.uploadSection.classList.add("hidden");
+    els.resultsSection.classList.remove("hidden");
+    els.resetRow.classList.remove("hidden");
+    state.segments = saved.segments;
+    els.transcriptBody.replaceChildren();
+    saved.segments.forEach(appendSegment);
+    els.copyTranscript.disabled = false;
+    if (saved.analysis) {
+      state.analysis = saved.analysis;
+      renderAnalysis(saved.analysis);
+      els.copyAnalysis.disabled = false;
     }
-    finish();
+    showBanner("info", "שוחזרו התוצאות מהניתוח האחרון. לניתוח חדש לחצו על \"ניתוח שיחה חדשה\".");
+    return;
+  }
+
+  if (saved.stage === "analyzing" && saved.segments?.length) {
+    els.uploadSection.classList.add("hidden");
+    els.progressSection.classList.remove("hidden");
+    els.resultsSection.classList.remove("hidden");
+    state.segments = saved.segments;
+    els.transcriptBody.replaceChildren();
+    saved.segments.forEach(appendSegment);
+    els.copyTranscript.disabled = false;
+    showBanner("info", "השיחה שוחזרה — ממשיך בניתוח מהנקודה שבה נעצר.");
+    startTimer();
+    keepAwake(true);
+    if (hasWebGPU) preloadLLM();
+    await runAnalysisStage(saved.segments);
+    return;
+  }
+
+  if (saved.stage === "transcribing" && saved.file) {
+    if (saved.model) els.modelSelect.value = saved.model;
+    await run(saved.file, {
+      processedSec: saved.processedSec || 0,
+      doneSegments: saved.doneSegments || [],
+    });
   }
 }
 
@@ -174,7 +359,9 @@ function friendlyError(err) {
 }
 
 function finish() {
+  state.stage = "done";
   stopTimer();
+  keepAwake(false);
   els.progressSection.classList.add("hidden");
   els.resetRow.classList.remove("hidden");
 }
@@ -199,12 +386,14 @@ async function decodeAudio(file) {
 }
 
 /* ===== Transcription via worker ===== */
-function transcribe(audio) {
+function transcribe(audio, baseOffset = 0) {
   const duration = audio.length / 16000;
+  const total = state.totalDuration || (baseOffset + duration);
   return new Promise((resolve, reject) => {
     const worker = new Worker("js/asr-worker.js", { type: "module" });
     state.worker = worker;
     state.stage = "asr";
+    let lastPartial = null;
     worker.onmessage = (event) => {
       const msg = event.data;
       if (msg.type === "download") {
@@ -212,16 +401,31 @@ function transcribe(audio) {
         setProgressBar(msg.percent);
       } else if (msg.type === "stage" && msg.stage === "transcribing") {
         setStage(msg.device === "webgpu" ? "מתמלל את השיחה… (מואץ GPU)" : "מתמלל את השיחה…");
-        setProgressBar(0);
+        setProgressBar(total ? Math.round((baseOffset / total) * 100) : 0);
       } else if (msg.type === "progress") {
-        setProgressBar(msg.percent);
+        const absSec = baseOffset + (msg.percent / 100) * duration;
+        setProgressBar(Math.min(99, Math.round((absSec / total) * 100)));
       } else if (msg.type === "partial") {
-        renderPartialSegment(msg.start, msg.text);
+        const absStart = msg.start + baseOffset;
+        if (lastPartial && absStart !== lastPartial.start && lastPartial.text.trim()) {
+          // A chunk just finished — checkpoint it so a killed tab resumes here.
+          state.completedChunks.push({ start: lastPartial.start, end: absStart, text: lastPartial.text.trim() });
+          sessionSave({
+            processedSec: absStart,
+            doneSegments: [...state.priorSegments, ...state.completedChunks],
+          });
+        }
+        lastPartial = { start: absStart, text: msg.text };
+        renderPartialSegment(absStart, msg.text);
       } else if (msg.type === "result") {
         setProgressBar(100);
         worker.terminate();
         state.worker = null;
-        resolve(msg.segments);
+        resolve(msg.segments.map((s) => ({
+          start: s.start + baseOffset,
+          end: s.end + baseOffset,
+          text: s.text,
+        })));
       } else if (msg.type === "error") {
         worker.terminate();
         state.worker = null;
@@ -620,3 +824,6 @@ function resetUI() {
   els.resetRow.classList.add("hidden");
   els.uploadSection.classList.remove("hidden");
 }
+
+/* ===== Init ===== */
+tryRestoreSession();

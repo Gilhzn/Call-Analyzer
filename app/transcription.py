@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import os
 import threading
@@ -42,17 +41,9 @@ class WhisperEngine:
                     log.info("whisper model loaded")
         return self._model
 
-    def transcribe_to_queue(
-        self,
-        path: str,
-        loop: asyncio.AbstractEventLoop,
-        queue: "asyncio.Queue[tuple[str, dict]]",
-    ) -> list[dict]:
-        """Runs in a worker thread. Streams segments into the job queue as they
-        are decoded and returns the full segment list."""
-
-        def push(event: str, data: dict) -> None:
-            loop.call_soon_threadsafe(queue.put_nowait, (event, data))
+    def transcribe_streaming(self, path: str, push) -> list[dict]:
+        """Runs in a worker thread. Streams segments through the (thread-safe)
+        `push` callable as they are decoded and returns the full segment list."""
 
         if not self.loaded:
             push("status", {"stage": "loading_model", "model": self._settings.whisper_model})

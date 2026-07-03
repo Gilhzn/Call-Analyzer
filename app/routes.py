@@ -91,12 +91,15 @@ async def process_job(job: Job, tmp_path: str, state) -> None:
     warmup_task = asyncio.create_task(state.ollama.warmup())
     warmup_task.add_done_callback(lambda t: t.exception())
     try:
+        def push_threadsafe(event: str, data: dict) -> None:
+            loop.call_soon_threadsafe(job.emit, event, data)
+
         try:
             if state.semaphore.locked():
                 job.emit("status", {"stage": "queued"})
             async with state.semaphore:
                 segments = await loop.run_in_executor(
-                    None, state.engine.transcribe_to_queue, tmp_path, loop, job.queue
+                    None, state.engine.transcribe_streaming, tmp_path, push_threadsafe
                 )
         finally:
             try:
@@ -139,29 +142,52 @@ async def process_job(job: Job, tmp_path: str, state) -> None:
             job.emit("error", {"code": "internal", "message": ERR_INTERNAL})
 
 
+@router.get("/jobs/{job_id}")
+async def job_status(job_id: str, request: Request):
+    job = request.app.state.registry.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail={"code": "job_not_found", "message": "העבודה לא נמצאה."})
+    return {"id": job.id, "events": len(job.history), "done": job.done}
+
+
 @router.get("/jobs/{job_id}/stream")
 async def stream_job(job_id: str, request: Request):
     registry = request.app.state.registry
     job = registry.get(job_id)
-    if job is None or job.consumed:
-        raise HTTPException(status_code=404, detail={"code": "job_not_found", "message": "המשרה לא נמצאה או שכבר נצרכה."})
-    job.consumed = True
+    if job is None:
+        raise HTTPException(status_code=404, detail={"code": "job_not_found", "message": "העבודה לא נמצאה."})
+
+    # Resume support: EventSource sends Last-Event-ID automatically on
+    # reconnect; a reloaded page passes ?after=<last id it stored>.
+    after = -1
+    for raw in (request.query_params.get("after"), request.headers.get("last-event-id")):
+        if raw is not None:
+            try:
+                after = max(after, int(raw))
+            except ValueError:
+                pass
 
     async def event_stream():
-        try:
-            while True:
-                try:
-                    event, data = await asyncio.wait_for(job.queue.get(), timeout=15.0)
-                except asyncio.TimeoutError:
-                    # Heartbeat so proxies don't drop the connection while the
-                    # whisper model loads or a long LLM call runs.
-                    yield ": ping\n\n"
-                    continue
-                yield sse(event, data)
+        idx = after + 1
+        while True:
+            if idx < len(job.history):
+                event, data = job.history[idx]
+                yield sse(event, data, event_id=idx)
+                idx += 1
                 if event in ("done", "error"):
                     break
-        finally:
-            registry.finish(job_id)
+                continue
+            if job.done or registry.get(job_id) is None:
+                break
+            job.updated.clear()
+            if idx < len(job.history):
+                continue
+            try:
+                await asyncio.wait_for(job.updated.wait(), timeout=15.0)
+            except asyncio.TimeoutError:
+                # Heartbeat so proxies don't drop the connection while the
+                # whisper model loads or a long LLM call runs.
+                yield ": ping\n\n"
 
     return StreamingResponse(
         event_stream(),

@@ -406,3 +406,4 @@ html, body {
 
 .seg.live span { opacity: 0.75; }
 .seg.live::after { content: "…"; color: var(--text-muted); }
+.banner.info { background: var(--primary-soft); color: var(--primary); }

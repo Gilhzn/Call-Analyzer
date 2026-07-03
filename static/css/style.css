@@ -375,3 +375,4 @@ html, body {
   background: var(--primary);
   transition: width 0.25s ease;
 }
+.banner.info { background: var(--primary-soft); color: var(--primary); }

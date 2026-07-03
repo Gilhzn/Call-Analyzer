@@ -34,7 +34,102 @@ const state = {
   timerId: null,
   startedAt: null,
   duration: 0,
+  jobId: null,
+  lastEventId: -1,
 };
+
+/* ===== Session persistence =====
+   Mobile browsers kill background tabs; the transcript/analysis so far and
+   the job id are saved locally, and on reload the page reconnects to the
+   server stream from the exact event where it stopped. */
+const STORAGE_KEY = "call-analyzer-session";
+let saveTimer = null;
+
+function saveSession(patch = {}) {
+  try {
+    const current = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      ...current,
+      jobId: state.jobId,
+      lastEventId: state.lastEventId,
+      duration: state.duration,
+      segments: state.segments,
+      analysis: state.analysis,
+      savedAt: Date.now(),
+      ...patch,
+    }));
+  } catch { /* storage full/unavailable — resume just won't be possible */ }
+}
+
+function saveSessionThrottled() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => { saveTimer = null; saveSession(); }, 800);
+}
+
+function clearSession() {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  try { localStorage.removeItem(STORAGE_KEY); } catch { /* ignore */ }
+}
+
+function loadSession() {
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "null"); } catch { return null; }
+}
+
+async function tryRestoreSession() {
+  const saved = loadSession();
+  if (!saved || !saved.stage) return;
+
+  const showResults = () => {
+    els.uploadSection.classList.add("hidden");
+    els.resultsSection.classList.remove("hidden");
+    state.segments = saved.segments || [];
+    state.duration = saved.duration || 0;
+    els.transcriptBody.replaceChildren();
+    state.segments.forEach(appendSegment);
+    els.copyTranscript.disabled = state.segments.length === 0;
+    if (saved.analysis) {
+      state.analysis = saved.analysis;
+      renderAnalysis(saved.analysis);
+      els.copyAnalysis.disabled = false;
+    }
+  };
+
+  if (saved.stage === "done") {
+    showResults();
+    els.resetRow.classList.remove("hidden");
+    showBanner("info", "שוחזרו התוצאות מהניתוח האחרון. לניתוח חדש לחצו על \"ניתוח שיחה חדשה\".");
+    return;
+  }
+
+  // Mid-job: check the job still exists on the server, then re-attach to the
+  // stream from the last event we already received.
+  let alive = false;
+  try {
+    const res = await fetch(`/api/jobs/${saved.jobId}`);
+    alive = res.ok;
+  } catch { alive = false; }
+
+  showResults();
+  if (!alive) {
+    els.resetRow.classList.remove("hidden");
+    if (state.segments.length) {
+      renderAnalysisError("החיבור לעיבוד אבד (העבודה כבר לא זמינה בשרת). התמליל ששוחזר זמין להעתקה — לניתוח מלא העלו את הקובץ שוב.");
+      showBanner("warning", "התמליל שוחזר, אך העיבוד בשרת הסתיים או פג תוקפו.");
+    } else {
+      clearSession();
+      resetUI();
+    }
+    return;
+  }
+
+  state.jobId = saved.jobId;
+  state.lastEventId = saved.lastEventId ?? -1;
+  els.progressSection.classList.remove("hidden");
+  setStage("ממשיך מהנקודה שבה נעצר…");
+  showBanner("info", "השיחה שוחזרה — ממשיך מהנקודה שבה נעצר.");
+  startTimer();
+  listen(saved.jobId, state.lastEventId);
+}
 
 /* ===== Health banner ===== */
 async function checkHealth() {
@@ -53,7 +148,8 @@ async function checkHealth() {
         `מודל הניתוח "${health.ollama.model}" אינו מותקן ב-Ollama. התקינו אותו עם הפקודה `,
         `ollama pull ${health.ollama.model}`
       );
-    } else {
+    } else if (els.banner.classList.contains("warning")) {
+      // Clear only our own health warning — never a restore/info banner.
       hideBanner();
     }
   } catch {
@@ -102,6 +198,7 @@ async function upload(file) {
     return;
   }
 
+  clearSession();
   resetState();
   els.uploadSection.classList.add("hidden");
   els.progressSection.classList.remove("hidden");
@@ -126,6 +223,9 @@ async function upload(file) {
 
   els.resultsSection.classList.remove("hidden");
   setStage("מכין את מנוע התמלול…");
+  state.jobId = jobId;
+  state.lastEventId = -1;
+  saveSession({ stage: "processing" });
   listen(jobId);
 }
 
@@ -137,11 +237,18 @@ function failEarly(message) {
 }
 
 /* ===== SSE ===== */
-function listen(jobId) {
-  const es = new EventSource(`/api/jobs/${jobId}/stream`);
+function listen(jobId, after = -1) {
+  const url = `/api/jobs/${jobId}/stream` + (after >= 0 ? `?after=${after}` : "");
+  const es = new EventSource(url);
   state.eventSource = es;
 
+  const track = (e) => {
+    const id = parseInt(e.lastEventId, 10);
+    if (!Number.isNaN(id)) state.lastEventId = id;
+  };
+
   es.addEventListener("status", (e) => {
+    track(e);
     const data = JSON.parse(e.data);
     switch (data.stage) {
       case "queued":
@@ -169,43 +276,52 @@ function listen(jobId) {
   });
 
   es.addEventListener("segment", (e) => {
+    track(e);
     const seg = JSON.parse(e.data);
     state.segments.push(seg);
     appendSegment(seg);
     if (state.duration) {
       setProgressBar(Math.min(99, Math.round((seg.end / state.duration) * 100)));
     }
+    saveSessionThrottled();
   });
 
-  es.addEventListener("transcript_done", () => {
+  es.addEventListener("transcript_done", (e) => {
+    track(e);
     els.copyTranscript.disabled = state.segments.length === 0;
     setProgressBar(100);
+    saveSession();
   });
 
   es.addEventListener("analysis", (e) => {
+    track(e);
     state.analysis = JSON.parse(e.data);
     renderAnalysis(state.analysis);
     els.copyAnalysis.disabled = false;
+    saveSession();
   });
 
   es.addEventListener("error", (e) => {
-    // Custom server "error" events carry data; transport errors do not.
+    // Custom server "error" events carry data; transport errors do not
+    // (EventSource reconnects those automatically with Last-Event-ID).
     if (e.data) {
+      track(e);
       const data = JSON.parse(e.data);
       renderAnalysisError(data.message);
-      finishJob();
-    } else if (es.readyState === EventSource.CLOSED) {
-      renderAnalysisError("החיבור לשרת נותק. נסו שוב.");
       finishJob();
     }
   });
 
-  es.addEventListener("done", finishJob);
+  es.addEventListener("done", (e) => {
+    track(e);
+    finishJob();
+  });
 }
 
 function finishJob() {
   if (state.eventSource) { state.eventSource.close(); state.eventSource = null; }
   stopTimer();
+  saveSession({ stage: "done" });
   els.progressSection.classList.add("hidden");
   els.resetRow.classList.remove("hidden");
 }
@@ -213,14 +329,20 @@ function finishJob() {
 els.cancelBtn.addEventListener("click", () => {
   if (state.eventSource) { state.eventSource.close(); state.eventSource = null; }
   stopTimer();
+  clearSession();
   resetUI();
 });
 
-els.resetBtn.addEventListener("click", resetUI);
+els.resetBtn.addEventListener("click", () => {
+  clearSession();
+  resetUI();
+});
 
 function resetState() {
   state.segments = [];
   state.analysis = null;
+  state.jobId = null;
+  state.lastEventId = -1;
   hideBanner();
   els.transcriptBody.replaceChildren(placeholderEl("התמליל יופיע כאן בזמן אמת…"));
   els.analysisBody.replaceChildren(placeholderEl("הניתוח והסיכום יופיעו כאן לאחר התמלול…"));
@@ -485,3 +607,4 @@ function stopTimer() {
 
 /* ===== Init ===== */
 checkHealth();
+tryRestoreSession();
