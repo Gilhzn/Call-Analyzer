@@ -263,7 +263,12 @@ function listen(jobId, after = -1) {
         setStage("טוען את מודל התמלול (בפעם הראשונה זה עשוי לקחת מספר דקות)…");
         break;
       case "uploading_cloud":
-        setStage("מעבד על GPU בענן (Groq)…");
+        if (data.chunks) {
+          setStage(`מתמלל בענן — חלק ${data.chunk} מתוך ${data.chunks}…`);
+          setProgressBar(Math.round(((data.chunk - 1) / data.chunks) * 100));
+        } else {
+          setStage("מעבד על GPU בענן (Groq)…");
+        }
         break;
       case "transcribing":
         setStage(data.cloud ? "מתמלל על GPU בענן…" : "מתמלל את השיחה…");

@@ -177,7 +177,7 @@ async def analyze(
     When the Groq cloud boost is enabled, a single call to the 120B model
     replaces the whole local pipeline."""
     if groq is not None and groq.enabled:
-        return await _analyze_groq(segments, groq, settings)
+        return await _analyze_groq(segments, groq, settings, progress=progress)
 
     transcript = build_transcript_text(segments)
     meta = AnalysisMeta(model=settings.ollama_model)
@@ -230,14 +230,33 @@ async def analyze(
     return result
 
 
-async def _analyze_groq(segments: list[dict], groq, settings: Settings) -> AnalysisResult:
+async def _analyze_groq(segments: list[dict], groq, settings: Settings, progress=None) -> AnalysisResult:
     transcript = build_transcript_text(segments)
     meta = AnalysisMeta(model=groq.llm_model)
-    if len(transcript) > settings.groq_max_analysis_chars:
-        transcript = transcript[: settings.groq_max_analysis_chars]
-        meta.truncated = True
 
-    user_msg = f"תמליל השיחה (עם חותמות זמן):\n\n{transcript}"
+    if len(transcript) <= settings.groq_max_analysis_chars:
+        user_msg = f"תמליל השיחה (עם חותמות זמן):\n\n{transcript}"
+    else:
+        # Long call: digest chunk-by-chunk, then produce one combined analysis
+        # so nothing important is cut.
+        meta.chunked = True
+        chunks = chunk_segments(segments, 12000)
+        if len(chunks) > settings.analysis_max_chunks:
+            meta.truncated = True
+            chunks = chunks[: settings.analysis_max_chunks]
+        digests = []
+        for i, chunk in enumerate(chunks, start=1):
+            if progress:
+                progress(i, len(chunks))
+            digest = await groq.chat(
+                MAP_SYSTEM_PROMPT,
+                f"קטע {i} מתוך {len(chunks)} של השיחה:\n\n{chunk}",
+            )
+            digests.append(f"--- קטע {i} ---\n{digest.strip()}")
+        user_msg = "תקצירי קטעי השיחה לפי סדר כרונולוגי:\n\n" + "\n\n".join(digests)
+        if len(user_msg) > settings.groq_max_analysis_chars:
+            user_msg = user_msg[: settings.groq_max_analysis_chars]
+            meta.truncated = True
     raw = await groq.chat(SYSTEM_PROMPT, user_msg)
     parsed = parse_analysis_json(raw)
     if parsed is None:

@@ -101,7 +101,12 @@ async def process_job(job: Job, tmp_path: str, state) -> None:
         try:
             if state.groq.enabled:
                 job.emit("status", {"stage": "uploading_cloud"})
-                segments, info = await state.groq.transcribe(tmp_path)
+                segments, info = await state.groq.transcribe_auto(
+                    tmp_path,
+                    progress=lambda i, n: job.emit(
+                        "status", {"stage": "uploading_cloud", "chunk": i, "chunks": n}
+                    ),
+                )
                 job.emit("status", {
                     "stage": "transcribing",
                     "language": info.get("language"),

@@ -5,12 +5,18 @@ for processing only; nothing is stored by this app."""
 import asyncio
 import logging
 import os
+import tempfile
 
 import httpx
 
+from .audio_split import split_to_wav_chunks
 from .config import Settings
 
 log = logging.getLogger("call_analyzer.groq")
+
+# Free-tier upload cap is 25MB — keep a safety margin.
+MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+CHUNK_SECONDS = 600
 
 
 class GroqError(Exception):
@@ -43,6 +49,42 @@ class GroqClient:
         if status == 429:
             return "חריגה ממכסת החינם"
         return f"שגיאת שירות ({status})"
+
+    async def transcribe_auto(self, path: str, progress=None) -> tuple[list[dict], dict]:
+        """Transcribe a file of any size: files over the 25MB upload cap are
+        split into 10-minute WAV chunks, transcribed part by part, and the
+        transcripts stitched back with continuous timestamps."""
+        if os.path.getsize(path) <= MAX_UPLOAD_BYTES:
+            return await self.transcribe(path)
+
+        loop = asyncio.get_running_loop()
+        with tempfile.TemporaryDirectory(prefix="call_chunks_") as tmp_dir:
+            try:
+                chunks = await loop.run_in_executor(
+                    None, split_to_wav_chunks, path, tmp_dir, CHUNK_SECONDS
+                )
+            except Exception as exc:
+                raise GroqError("פיצול הקובץ נכשל — ודאו שזה קובץ שמע תקין") from exc
+
+            segments: list[dict] = []
+            info: dict = {}
+            for i, (chunk_path, offset) in enumerate(chunks, start=1):
+                if progress:
+                    progress(i, len(chunks))
+                chunk_segments, chunk_info = await self.transcribe(chunk_path)
+                if not info:
+                    info = chunk_info
+                for seg in chunk_segments:
+                    segments.append({
+                        "start": round(seg["start"] + offset, 2),
+                        "end": round(seg["end"] + offset, 2),
+                        "text": seg["text"],
+                    })
+            if chunks:
+                last_path, last_offset = chunks[-1]
+                last_secs = max(0, os.path.getsize(last_path) - 44) / (16000 * 2)
+                info["duration"] = round(last_offset + last_secs, 1)
+            return segments, info
 
     async def transcribe(self, path: str) -> tuple[list[dict], dict]:
         try:

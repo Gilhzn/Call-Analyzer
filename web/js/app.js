@@ -32,8 +32,10 @@ const MAX_ANALYSIS_CHARS = 6000;
 const GROQ_BASE = "https://api.groq.com/openai/v1";
 const GROQ_ASR_MODEL = "whisper-large-v3-turbo";
 const GROQ_LLM_MODEL = "openai/gpt-oss-120b";
-const GROQ_MAX_FILE_MB = 25;        // free-tier upload cap
+const GROQ_MAX_FILE_MB = 24;        // free-tier upload cap is 25MB — keep a safety margin
+const CLOUD_CHUNK_SEC = 600;        // 10-minute WAV chunks (~19MB) for files over the cap
 const CLOUD_MAX_ANALYSIS_CHARS = 14000; // ~5.5k tokens, inside the 8K TPM free limit
+const CLOUD_ANALYSIS_MAX_CHUNKS = 8;    // map-reduce bound for very long calls
 const CLOUD_KEY_STORAGE = "call-analyzer-groq";
 
 function cloudSettings() {
@@ -257,27 +259,101 @@ function xhrUpload(url, key, form, onPercent) {
   });
 }
 
-async function cloudTranscribe(file, key) {
-  setStage("מעלה את ההקלטה לשרת ה-GPU…");
-  setProgressBar(0);
+async function cloudTranscribeBlob(blob, name, key, onPercent) {
   const form = new FormData();
-  form.append("file", file, file.name || "audio.mp3");
+  form.append("file", blob, name);
   form.append("model", GROQ_ASR_MODEL);
   form.append("response_format", "verbose_json");
 
-  const resp = await xhrUpload(`${GROQ_BASE}/audio/transcriptions`, key, form, (pct) =>
-    setProgressBar(Math.round(pct * 0.8)) // upload is ~80% of the wait; GPU does the rest in seconds
-  );
-  setStage("מתמלל על GPU בענן…");
-  setProgressBar(90);
-
+  const resp = await xhrUpload(`${GROQ_BASE}/audio/transcriptions`, key, form, onPercent);
   const segments = (resp.segments || [])
     .map((s) => ({ start: s.start ?? 0, end: s.end ?? s.start ?? 0, text: (s.text || "").trim() }))
     .filter((s) => s.text);
   if (!segments.length && (resp.text || "").trim()) {
     segments.push({ start: 0, end: 0, text: resp.text.trim() });
   }
+  return segments;
+}
+
+async function cloudTranscribe(file, key) {
+  setStage("מעלה את ההקלטה לשרת ה-GPU…");
+  setProgressBar(0);
+  const segments = await cloudTranscribeBlob(file, file.name || "audio.mp3", key, (pct) => {
+    setProgressBar(Math.round(pct * 0.8)); // upload is ~80% of the wait; GPU does the rest in seconds
+    if (pct >= 100) setStage("מתמלל על GPU בענן…");
+  });
   setProgressBar(100);
+  return segments;
+}
+
+/* Float32 (16kHz mono) → PCM16 WAV blob, so any format can be re-cut into
+   valid standalone audio files. */
+function encodeWav16(samples) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);      // PCM
+  view.setUint16(22, 1, true);      // mono
+  view.setUint32(24, 16000, true);  // sample rate
+  view.setUint32(28, 32000, true);  // byte rate
+  view.setUint16(32, 2, true);      // block align
+  view.setUint16(34, 16, true);     // bits per sample
+  writeStr(36, "data");
+  view.setUint32(40, samples.length * 2, true);
+  let off = 44;
+  for (let i = 0; i < samples.length; i++, off += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+/* Files over the free-tier 25MB cap: decode locally, cut into 10-minute WAV
+   chunks, transcribe each on the GPU, and stitch the transcripts back with
+   continuous timestamps. Each finished chunk is checkpointed for resume. */
+async function cloudTranscribeLarge(file, key, restore = null) {
+  setStage("קורא את ההקלטה ומחלק לחלקים (הקובץ גדול ממגבלת ההעלאה)…");
+  setProgressBar(null);
+  const audio = await decodeAudio(file);
+  state.totalDuration = audio.length / 16000;
+
+  const chunkSamples = CLOUD_CHUNK_SEC * 16000;
+  const numChunks = Math.max(1, Math.ceil(audio.length / chunkSamples));
+  let startChunk = 0;
+  let segments = [];
+  if (restore?.processedSec) {
+    startChunk = Math.min(Math.round(restore.processedSec / CLOUD_CHUNK_SEC), numChunks - 1);
+    segments = restore.doneSegments || [];
+    els.transcriptBody.replaceChildren();
+    segments.forEach(appendSegment);
+  }
+
+  for (let i = startChunk; i < numChunks; i++) {
+    if (state.cancelled) return segments;
+    const offset = i * CLOUD_CHUNK_SEC;
+    const slice = audio.subarray(i * chunkSamples, Math.min((i + 1) * chunkSamples, audio.length));
+    setStage(`מתמלל בענן — חלק ${i + 1} מתוך ${numChunks}…`);
+    const blob = encodeWav16(slice);
+    const chunkSegments = await cloudTranscribeBlob(blob, `part_${i + 1}.wav`, key, (pct) =>
+      setProgressBar(Math.round(((i + (pct / 100) * 0.9) / numChunks) * 100))
+    );
+    const shifted = chunkSegments.map((s) => ({
+      start: s.start + offset,
+      end: s.end + offset,
+      text: s.text,
+    }));
+    segments = segments.concat(shifted);
+    const ph = els.transcriptBody.querySelector(".placeholder");
+    if (ph) ph.remove();
+    shifted.forEach(appendSegment);
+    setProgressBar(Math.round(((i + 1) / numChunks) * 100));
+    sessionSave({ processedSec: (i + 1) * CLOUD_CHUNK_SEC, doneSegments: segments });
+  }
   return segments;
 }
 
@@ -304,21 +380,71 @@ async function groqChat(key, messages, jsonMode) {
   return data.choices?.[0]?.message?.content || "";
 }
 
+const MAP_SYSTEM_PROMPT =
+  "אתה מסכם קטעי שיחה עסקית. סכם את קטע השיחה שתקבל ב-5 עד 8 נקודות עובדתיות בעברית, " +
+  "כולל שמות, סכומים, תאריכים והתחייבויות שהוזכרו במפורש. אל תמציא מידע. השב בנקודות בלבד.";
+
+function chunkTranscript(segments, budget) {
+  const chunks = [];
+  let current = [];
+  let size = 0;
+  for (const seg of segments) {
+    const line = `[${formatTs(seg.start)}] ${seg.text}`;
+    if (current.length && size + line.length > budget) {
+      chunks.push(current.join("\n"));
+      current = [];
+      size = 0;
+    }
+    current.push(line);
+    size += line.length + 1;
+  }
+  if (current.length) chunks.push(current.join("\n"));
+  return chunks;
+}
+
 async function cloudAnalyze(segments, key) {
   state.stage = "analyzing";
   setStage("מנתח על GPU בענן (מודל 120B)…");
-  setProgressBar(30);
+  setProgressBar(10);
   showAnalysisSkeleton();
 
-  let transcript = segments.map((s) => `[${formatTs(s.start)}] ${s.text}`).join("\n");
+  const transcript = segments.map((s) => `[${formatTs(s.start)}] ${s.text}`).join("\n");
   let truncated = false;
-  if (transcript.length > CLOUD_MAX_ANALYSIS_CHARS) {
-    transcript = transcript.slice(0, CLOUD_MAX_ANALYSIS_CHARS);
-    truncated = true;
+  let chunked = false;
+  let userMsg;
+
+  if (transcript.length <= CLOUD_MAX_ANALYSIS_CHARS) {
+    userMsg = `תמליל השיחה (עם חותמות זמן):\n\n${transcript}`;
+  } else {
+    // Long call: digest chunk-by-chunk (map), then produce one combined
+    // analysis (reduce) — nothing important gets cut.
+    chunked = true;
+    let chunks = chunkTranscript(segments, 12000);
+    if (chunks.length > CLOUD_ANALYSIS_MAX_CHUNKS) {
+      truncated = true;
+      chunks = chunks.slice(0, CLOUD_ANALYSIS_MAX_CHUNKS);
+    }
+    const digests = [];
+    for (let i = 0; i < chunks.length; i++) {
+      setStage(`מנתח על GPU בענן — חלק ${i + 1} מתוך ${chunks.length}…`);
+      setProgressBar(Math.round(((i + 0.5) / (chunks.length + 1)) * 100));
+      const digest = await groqChat(key, [
+        { role: "system", content: MAP_SYSTEM_PROMPT },
+        { role: "user", content: `קטע ${i + 1} מתוך ${chunks.length} של השיחה:\n\n${chunks[i]}` },
+      ], false);
+      digests.push(`--- קטע ${i + 1} ---\n${(digest || "").trim()}`);
+    }
+    setStage("מאחד את הניתוח לסיכום אחד…");
+    userMsg = "תקצירי קטעי השיחה לפי סדר כרונולוגי:\n\n" + digests.join("\n\n");
+    if (userMsg.length > CLOUD_MAX_ANALYSIS_CHARS) {
+      userMsg = userMsg.slice(0, CLOUD_MAX_ANALYSIS_CHARS);
+      truncated = true;
+    }
   }
+
   const messages = [
     { role: "system", content: SYSTEM_PROMPT },
-    { role: "user", content: `תמליל השיחה (עם חותמות זמן):\n\n${transcript}` },
+    { role: "user", content: userMsg },
   ];
 
   let raw = await groqChat(key, messages, true).catch(() => null);
@@ -330,9 +456,9 @@ async function cloudAnalyze(segments, key) {
   }
   setProgressBar(100);
   if (!parsed) {
-    return { summary: (raw || "").trim(), key_points: [], action_items: [], participants: "", sentiment: "", topics: [], meta: { degraded: true, truncated, cloud: true } };
+    return { summary: (raw || "").trim(), key_points: [], action_items: [], participants: "", sentiment: "", topics: [], meta: { degraded: true, truncated, chunked, cloud: true } };
   }
-  parsed.meta = { truncated, degraded: false, cloud: true };
+  parsed.meta = { truncated, degraded: false, chunked, cloud: true };
   return normalizeAnalysis(parsed);
 }
 
@@ -345,9 +471,14 @@ function friendlyCloudError(err) {
   return "שגיאה בשירות הענן";
 }
 
-async function runCloud(file, key) {
-  sessionSave({ stage: "transcribing", file, fileName: file.name, processedSec: 0, doneSegments: [] });
-  const segments = await cloudTranscribe(file, key);
+async function runCloud(file, key, restore = null) {
+  if (!restore) {
+    sessionSave({ stage: "transcribing", file, fileName: file.name, processedSec: 0, doneSegments: [] });
+  }
+  const isLarge = file.size > GROQ_MAX_FILE_MB * 1024 * 1024;
+  const segments = isLarge
+    ? await cloudTranscribeLarge(file, key, restore)
+    : await cloudTranscribe(file, key);
   if (state.cancelled) return;
   await finishTranscript(segments);
 }
@@ -368,20 +499,17 @@ async function run(file, restore = null) {
     showBanner("info", `השיחה שוחזרה — ממשיך בתמלול מהנקודה שבה נעצר (${formatTs(restore.processedSec || 0)}).`);
   }
 
-  // Free GPU cloud boost: much faster and more accurate; falls back to
-  // in-browser processing on any failure.
+  // Free GPU cloud boost: much faster and more accurate; files over the
+  // 25MB upload cap are split into 10-minute chunks automatically. Falls
+  // back to in-browser processing on any failure.
   if (cloudActive()) {
-    if (file.size <= GROQ_MAX_FILE_MB * 1024 * 1024) {
-      try {
-        await runCloud(file, cloudSettings().key.trim());
-        return;
-      } catch (err) {
-        if (state.cancelled) return;
-        console.error(err);
-        showBanner("warning", `האצת הענן נכשלה (${friendlyCloudError(err)}) — ממשיך בעיבוד מקומי בדפדפן.`);
-      }
-    } else {
-      showBanner("warning", `הקובץ גדול ממגבלת החינם של הענן (${GROQ_MAX_FILE_MB}MB) — מעבד מקומית בדפדפן.`);
+    try {
+      await runCloud(file, cloudSettings().key.trim(), restore);
+      return;
+    } catch (err) {
+      if (state.cancelled) return;
+      console.error(err);
+      showBanner("warning", `האצת הענן נכשלה (${friendlyCloudError(err)}) — ממשיך בעיבוד מקומי בדפדפן.`);
     }
   }
 
